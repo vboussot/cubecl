@@ -163,8 +163,12 @@ impl ComputeStorage for WgpuStorage {
 
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(self)))]
     fn dealloc(&mut self, id: StorageId) {
+        // Dropping a buffer frees nothing on the web backend until the browser collects its JavaScript
+        // object, which a page busy in wasm may never do: destroy it. A page is freed only once no
+        // recorded command binds it, after its stream's submit.
         if let Some(memory) = self.memory.remove(&id) {
             self.allocated -= memory.buffer.size();
+            memory.buffer.destroy();
         }
     }
 
