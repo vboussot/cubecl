@@ -276,6 +276,18 @@ impl<K: AutotuneKey> Tuner<K> {
                 cur
             };
 
+            // A seeded pick indexes the kernels this device is offered; one taken from a device with
+            // more of them (a browser with the subgroups feature) points past the list and is measured
+            // instead of launched.
+            if matches!(cur, TuneCacheResult::Miss)
+                && let Some(fastest_index) = cache.seeded(key)
+            {
+                if fastest_index < tunables.len() {
+                    return TuneCacheResult::Hit { fastest_index };
+                }
+                cache.forget_seeded(key);
+            }
+
             match cur {
                 TuneCacheResult::Hit { .. } | TuneCacheResult::Pending => return cur,
                 TuneCacheResult::Miss | TuneCacheResult::Unchecked => {
@@ -643,7 +655,6 @@ async fn process_request<K: AutotuneKey>(
     // Read before the sort, which reorders `results` out of tunable order. A
     // decided candidate whose own outcome is an error is one `Schedule::run_plan`
     // picked with nothing measured — the tune executed but could not be timed.
-    #[cfg(persistence)]
     let unmeasured = decided.is_some_and(|index| results[index].outcome.is_err());
 
     results.sort_by(|a, b| {
@@ -681,6 +692,10 @@ async fn process_request<K: AutotuneKey>(
         // In-memory regardless: without it this key re-tunes on every call, and
         // a tune that measured nothing would keep failing the same way.
         cache.lock().cache_insert(key.clone(), fastest_index);
+        // Nor exported: a later run seeded with it would never measure the key.
+        if !unmeasured {
+            cache.lock().export(&key, fastest_index);
+        }
 
         // Not on disk, though. An unmeasured decision is a guess made to keep
         // the device thread alive, and the failures that produce one — a

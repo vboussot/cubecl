@@ -101,6 +101,31 @@ impl PartialEq for AutotuneResult {
     }
 }
 
+/// The kernels picked in this process, keyed by [`pick_key`]: a caller exports
+/// them once tuned ([`autotune_picks`]) and seeds a later run of the same build with them
+/// ([`seed_autotune_picks`]). An index names a kernel of that build's tunable sets, so picks carry over
+/// only between runs of one build.
+static PICKS: cubecl_environment::sync::Mutex<Option<HashMap<String, usize>>> =
+    cubecl_environment::sync::Mutex::new(None);
+
+fn pick_key(cache: &str, key: &impl core::fmt::Display) -> String {
+    alloc::format!("{cache}|{key}")
+}
+
+/// Every kernel measured so far by the tuners of this process, and every seeded pick, as
+/// `(<device>/<tuner>|<key>, index)`.
+pub fn autotune_picks() -> alloc::vec::Vec<(String, usize)> {
+    (PICKS.lock().iter().flatten())
+        .map(|(key, &index)| (key.clone(), index))
+        .collect()
+}
+
+/// Picks a tuner takes instead of measuring, for the keys [`autotune_picks`] exported from a run of the
+/// same build.
+pub fn seed_autotune_picks(picks: impl IntoIterator<Item = (String, usize)>) {
+    PICKS.lock().get_or_insert_with(HashMap::new).extend(picks);
+}
+
 /// Use to find and reuse the best kernel for some input
 #[derive(Debug)]
 pub(crate) struct TuneCache<K> {
@@ -128,6 +153,8 @@ pub(crate) struct TuneCache<K> {
     /// see [`cubecl_environment::environment::generation`].
     #[cfg(persistence)]
     generation: u32,
+    /// The device and tuner the picks of this cache are exported under.
+    id: String,
 }
 
 /// Result of the cache try
@@ -149,10 +176,7 @@ pub enum TuneCacheResult {
 }
 
 impl<K: AutotuneKey> TuneCache<K> {
-    pub(crate) fn new(
-        #[cfg_attr(not(persistence), allow(unused_variables))] name: &str,
-        #[cfg_attr(not(persistence), allow(unused_variables))] device_id: &str,
-    ) -> Self {
+    pub(crate) fn new(name: &str, device_id: &str) -> Self {
         #[cfg(persistence)]
         {
             use crate::config::RuntimeConfig;
@@ -165,6 +189,7 @@ impl<K: AutotuneKey> TuneCache<K> {
             if config.autotune.disable_cache {
                 return TuneCache {
                     in_memory_cache: HashMap::new(),
+                    id: format!("{device_id}/{name}"),
                     persistent_cache: None,
                     table,
                     hydrated: true,
@@ -178,6 +203,7 @@ impl<K: AutotuneKey> TuneCache<K> {
             let generation = cubecl_environment::environment::generation();
             let mut cache = TuneCache {
                 in_memory_cache: HashMap::new(),
+                id: format!("{device_id}/{name}"),
                 persistent_cache: Some(Store::new(
                     StoreOptions::new()
                         .storage(namespace)
@@ -198,6 +224,7 @@ impl<K: AutotuneKey> TuneCache<K> {
         {
             TuneCache {
                 in_memory_cache: HashMap::new(),
+                id: alloc::format!("{device_id}/{name}"),
             }
         }
     }
@@ -278,6 +305,29 @@ impl<K: AutotuneKey> TuneCache<K> {
     /// for the same key.
     pub(crate) fn mark_pending(&mut self, key: K) {
         self.in_memory_cache.insert(key, CacheEntry::Pending);
+    }
+
+    /// The pick seeded for `key`, now in this cache.
+    pub(crate) fn seeded(&mut self, key: &K) -> Option<usize> {
+        let index = *PICKS.lock().as_ref()?.get(&pick_key(&self.id, key))?;
+        self.cache_insert(key.clone(), index);
+        Some(index)
+    }
+
+    /// Drops a seeded pick that named no kernel of this device, so the key is measured.
+    pub(crate) fn forget_seeded(&mut self, key: &K) {
+        self.in_memory_cache.remove(key);
+        if let Some(picks) = PICKS.lock().as_mut() {
+            picks.remove(&pick_key(&self.id, key));
+        }
+    }
+
+    /// Lists `key`'s measured pick among the picks [`autotune_picks`] exports.
+    pub(crate) fn export(&self, key: &K, fastest_index: usize) {
+        PICKS
+            .lock()
+            .get_or_insert_with(HashMap::new)
+            .insert(pick_key(&self.id, key), fastest_index);
     }
 
     pub(crate) fn cache_insert(&mut self, key: K, fastest_index: usize) {
@@ -392,5 +442,40 @@ impl<K: AutotuneKey> TuneCache<K> {
             ),
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::fmt::Display;
+
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+
+    #[derive(Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize, Debug)]
+    struct Shape(u32);
+
+    impl Display for Shape {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "shape {}", self.0)
+        }
+    }
+
+    impl AutotuneKey for Shape {}
+
+    #[test]
+    fn a_pick_exported_seeds_a_later_cache_of_the_same_device_and_tuner() {
+        let mut first = TuneCache::<Shape>::new("matmul", "gpu-0");
+        first.export(&Shape(7), 3);
+        let picks = autotune_picks();
+        assert!(picks.contains(&(String::from("gpu-0/matmul|shape 7"), 3)));
+
+        seed_autotune_picks(picks);
+        let mut later = TuneCache::<Shape>::new("matmul", "gpu-0");
+        assert_eq!(later.seeded(&Shape(7)), Some(3));
+        assert_eq!(later.seeded(&Shape(8)), None);
+        let mut other = TuneCache::<Shape>::new("conv", "gpu-0");
+        assert_eq!(other.seeded(&Shape(7)), None);
     }
 }
