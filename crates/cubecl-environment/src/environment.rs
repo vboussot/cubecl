@@ -285,10 +285,19 @@ pub fn list() -> Vec<String> {
 /// Natively it is optional: a store opens the database itself on first use.
 /// Without a durable backend there is nothing to open.
 pub async fn open() {
-    #[cfg(any(native_cache, browser_cache))]
-    if let Err(error) = crate::persistence::turso::open_ahead().await {
+    if let Err(error) = try_open().await {
         log::warn!("Unable to open the Turso cache ahead of its use: {error}");
     }
+}
+
+/// [`open`], saying why the database did not open: in the browser, most
+/// often another tab or worker holding it, which a caller can answer by
+/// activating another environment.
+pub async fn try_open() -> Result<(), String> {
+    #[cfg(any(native_cache, browser_cache))]
+    return crate::persistence::turso::open_ahead().await;
+    #[cfg(not(any(native_cache, browser_cache)))]
+    Ok(())
 }
 
 /// A [`Store`] created from the options, bound to the active environment
