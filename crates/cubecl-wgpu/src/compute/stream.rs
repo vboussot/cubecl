@@ -888,6 +888,8 @@ impl WgpuStream {
 
         // This will _first_ fire off all pending write_buffer work.
         let index = self.queue.submit([tasks_encoder.finish()]);
+        // The pages freed while the encoder recorded are bound by nothing recorded after it.
+        self.memory.storage().destroy_retired();
 
         // Release cross-stream input pins.
         if !self.shared_bindings.is_empty() {

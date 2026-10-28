@@ -13,6 +13,8 @@ const MIN_BUFFER_SIZE: u64 = 32;
 /// Buffer storage for wgpu.
 pub struct WgpuStorage {
     memory: HashMap<StorageId, WgpuMemory>,
+    /// The buffers freed since the stream last submitted, destroyed after it does.
+    retired: Vec<wgpu::Buffer>,
     /// The bytes `memory` holds.
     allocated: u64,
     device: wgpu::Device,
@@ -102,6 +104,7 @@ impl WgpuStorage {
     ) -> Self {
         Self {
             memory: HashMap::new(),
+            retired: Vec::new(),
             allocated: 0,
             device,
             buffer_usages: usages,
@@ -164,11 +167,12 @@ impl ComputeStorage for WgpuStorage {
     #[cfg_attr(feature = "tracing", tracing::instrument(level = "trace", skip(self)))]
     fn dealloc(&mut self, id: StorageId) {
         // Dropping a buffer frees nothing on the web backend until the browser collects its JavaScript
-        // object, which a page busy in wasm may never do: destroy it. A page is freed only once no
-        // recorded command binds it, after its stream's submit.
+        // object, which a page busy in wasm may never do: it is destroyed instead, once the commands
+        // its stream recorded are submitted (`destroy_retired`). A page frees as soon as no handle
+        // holds it, while the stream's open encoder may still bind it.
         if let Some(memory) = self.memory.remove(&id) {
             self.allocated -= memory.buffer.size();
-            memory.buffer.destroy();
+            self.retired.push(memory.buffer);
         }
     }
 
@@ -182,6 +186,13 @@ impl ComputeStorage for WgpuStorage {
 }
 
 impl WgpuStorage {
+    /// Destroy the buffers freed before the stream's last submit: no command recorded since binds them.
+    pub(crate) fn destroy_retired(&mut self) {
+        for buffer in self.retired.drain(..) {
+            buffer.destroy();
+        }
+    }
+
     #[cfg(feature = "spirv")]
     fn create_buffer(&self, desc: &wgpu::BufferDescriptor<'_>) -> Result<WgpuMemory, IoError> {
         if self.vk_storage {
