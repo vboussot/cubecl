@@ -146,6 +146,48 @@ impl<C: WgpuCompiler> WgpuServer<C> {
         res
     }
 
+    /// Loads a WGSL kernel from the compilation store if present and creates its pipeline. Returns
+    /// `None` if the store isn't enabled, `Some(Ok(pipeline))` on a hit, and `Some(Err(cache_key))`
+    /// when the store is enabled but doesn't hold this kernel.
+    #[allow(
+        clippy::type_complexity,
+        reason = "required because of error propagation"
+    )]
+    pub fn load_cached_wgsl(
+        &mut self,
+        kernel_id: &KernelId,
+        bindings: &KernelArguments,
+        mode: ExecutionMode,
+    ) -> Result<
+        Option<Result<crate::compute::PipelineEntry, (u64, KernelCacheKey)>>,
+        CompilationError,
+    > {
+        let Some(cache) = self.wgsl_cache.as_mut() else {
+            return Ok(None);
+        };
+        let key = (
+            self.utilities.properties_hash,
+            KernelCacheKey::new(kernel_id, self.wgsl_build_id),
+        );
+        let Some(entry) = cache.remove(&key) else {
+            return Ok(Some(Err(key)));
+        };
+        log::trace!("Using WGSL cache");
+        let module = self.create_module(
+            &entry.entrypoint_name,
+            kernel_id.cube_dim.into(),
+            ModuleSource::Wgsl(&entry.source),
+            mode,
+        )?;
+        let pipeline = self.create_pipeline_with(
+            &entry.entrypoint_name,
+            Some(wgsl::buffer_bindings(&entry.buffers, bindings)),
+            module,
+        )?;
+        let io = entry.io.map(std::sync::Arc::from);
+        Ok(Some(Ok((pipeline, crate::compute::CompilerInfo::WGSL, io))))
+    }
+
     pub fn create_module(
         &self,
         entrypoint_name: &str,
@@ -269,7 +311,17 @@ impl<C: WgpuCompiler> WgpuServer<C> {
             Some(AutoRepresentationRef::SpirV(repr)) => Some(vulkan::bindings(repr, bindings)),
             _ => None,
         };
+        self.create_pipeline_with(entrypoint_name, bindings_info, module)
+    }
 
+    /// Creates the pipeline of `module` with the layout `bindings_info` describes: its bindings'
+    /// visibilities and its immediate size, or the layout the shader implies when `None`.
+    pub fn create_pipeline_with(
+        &self,
+        entrypoint_name: &str,
+        bindings_info: Option<(Vec<Visibility>, usize)>,
+        module: ShaderModule,
+    ) -> Result<Arc<ComputePipeline>, CompilationError> {
         let create = || {
             let layout = bindings_info.map(|(bindings, immediate_size)| {
                 if !bindings.is_empty() {

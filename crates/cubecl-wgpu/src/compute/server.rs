@@ -1,3 +1,4 @@
+use cubecl_core::prelude::Visibility;
 use cubecl_core::server::{DeviceCaptures, ServerStorage};
 use cubecl_server::kernel::BufferIOAttr;
 use cubecl_server::kernel::DebugInformation;
@@ -28,12 +29,10 @@ use cubecl_core::{
 };
 use cubecl_environment::backtrace::BackTrace;
 use cubecl_environment::future::DynFut;
-#[cfg(feature = "spirv")]
 use cubecl_environment::persistence::Store;
 use cubecl_environment::stream::StreamId;
 use cubecl_ir::MemoryDeviceProperties;
 use cubecl_server::compiler::CompilationRecording;
-#[cfg(feature = "spirv")]
 use cubecl_server::compiler::{KernelCacheKey, compilation_store, store_compiled};
 use cubecl_server::memory_management::{
     ManagedMemoryHandle, SharedMemoryBindings, StreamMemoryReport,
@@ -72,6 +71,16 @@ pub type PipelineEntry = (
     Option<Arc<[BufferIOAttr]>>,
 );
 
+/// What a WGSL kernel's pipeline is rebuilt from without compiling it again:
+/// the compilation store's entry for it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WgslCacheEntry {
+    pub(crate) entrypoint_name: String,
+    pub(crate) source: String,
+    pub(crate) buffers: Vec<Visibility>,
+    pub(crate) io: Option<Vec<BufferIOAttr>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompilerInfo {
     Vulkan { params_transfer: ParamsTransfer },
@@ -94,6 +103,10 @@ pub struct WgpuServer<C: WgpuCompiler> {
     pub(crate) spirv_cache: Option<Store<(u64, KernelCacheKey), cubecl_spirv::SpirvCacheEntry>>,
     #[cfg(feature = "spirv")]
     pub(crate) build_id: cubecl_common::hash::StableHash,
+    /// The WGSL kernels compiled on this device, by any run sharing the
+    /// environment, when compilation caching is on.
+    pub(crate) wgsl_cache: Option<Store<(u64, KernelCacheKey), WgslCacheEntry>>,
+    pub(crate) wgsl_build_id: cubecl_common::hash::StableHash,
     pub compilation_options: WgpuCompilationOptions,
     pub(crate) backend: wgpu::Backend,
     pub(crate) utilities: Arc<ServerUtilities>,
@@ -141,7 +154,6 @@ impl<C: WgpuCompiler> WgpuServer<C> {
         utilities: ServerUtilities,
         captures: DeviceCaptures,
     ) -> Self {
-        #[cfg(feature = "spirv")]
         let adapter_info = device.adapter_info();
         let backend_scheduler = ScheduledWgpuBackend::new(
             device.clone(),
@@ -165,12 +177,14 @@ impl<C: WgpuCompiler> WgpuServer<C> {
             format!("spirv_{}_{}", adapter_info.vendor, adapter_info.device),
         );
 
-        // WGSL is compiled by the driver on every run, so without the SPIR-V
-        // store there is nothing persisted for a switch to invalidate.
-        #[cfg(feature = "spirv")]
-        let pipelines = CompilationCache::mirroring(&spirv_cache);
-        #[cfg(not(feature = "spirv"))]
-        let pipelines = CompilationCache::unbound();
+        // The WGSL cubecl generates: the driver still compiles it on every
+        // run, but expanding, optimizing and printing it is skipped.
+        let wgsl_cache = compilation_store(
+            "wgsl",
+            format!("wgsl_{}_{}", adapter_info.vendor, adapter_info.device),
+        );
+
+        let pipelines = CompilationCache::mirroring(&wgsl_cache);
 
         Self {
             compilation_options,
@@ -190,6 +204,8 @@ impl<C: WgpuCompiler> WgpuServer<C> {
             spirv_cache,
             #[cfg(feature = "spirv")]
             build_id: cubecl_server::compiler::build_id_hash(),
+            wgsl_cache,
+            wgsl_build_id: cubecl_server::compiler::build_id_hash(),
             backend,
             utilities: Arc::new(utilities),
             shared_bindings_pool: LeasePool::with_capacity(tasks_max * max_streams as usize),
@@ -251,6 +267,15 @@ impl<C: WgpuCompiler> WgpuServer<C> {
             recording.loaded();
             return Ok(pipeline);
         }
+        let wgsl_key = match self.load_cached_wgsl(&kernel_id, bindings, mode)? {
+            Some(Ok(pipeline)) => {
+                self.pipelines.insert(kernel_id, pipeline.clone());
+                recording.loaded();
+                return Ok(pipeline);
+            }
+            Some(Err(key)) => Some(key),
+            None => None,
+        };
 
         validate_cube_dim(&self.utilities.properties, &kernel_id)?;
         validate_units(&self.utilities.properties, &kernel_id)?;
@@ -316,8 +341,19 @@ impl<C: WgpuCompiler> WgpuServer<C> {
 
         recording.source(&compiled.source);
 
-        // Only a SPIR-V kernel is stored: any other build changes nothing.
-        let stored = false;
+        let stored = match (wgsl_key, repr) {
+            (Some(key), Some(crate::AutoRepresentationRef::Wgsl(shader))) => store_compiled(
+                self.wgsl_cache.as_mut().unwrap(),
+                key,
+                WgslCacheEntry {
+                    entrypoint_name: compiled.entrypoint_name.clone(),
+                    source: compiled.source.clone(),
+                    buffers: shader.buffers.clone(),
+                    io: io.as_deref().map(<[BufferIOAttr]>::to_vec),
+                },
+            ),
+            _ => false,
+        };
         #[cfg(feature = "spirv")]
         let stored = match (cached, auto_repr) {
             (Some(Err(key)), Some(crate::AutoRepresentation::SpirV(kernel))) => {

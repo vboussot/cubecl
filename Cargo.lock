@@ -1446,6 +1446,7 @@ dependencies = [
  "pliron",
  "renderdoc",
  "sanitize-filename",
+ "serde",
  "test-log",
  "thiserror 2.0.20",
  "tracel-ash",

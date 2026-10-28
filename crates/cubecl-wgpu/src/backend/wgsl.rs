@@ -12,8 +12,14 @@ pub fn bindings(
     repr: &<WgslCompiler as Compiler>::Representation,
     args: &KernelArguments,
 ) -> (Vec<Visibility>, usize) {
-    let mut bindings = repr
-        .buffers
+    buffer_bindings(&repr.buffers, args)
+}
+
+/// The bindings of a WGSL kernel whose buffers are `buffers`, which is all of
+/// its representation a launch reads: a kernel loaded from the compilation
+/// store has nothing else of it.
+pub fn buffer_bindings(buffers: &[Visibility], args: &KernelArguments) -> (Vec<Visibility>, usize) {
+    let mut bindings = buffers
         .iter()
         .map(|vis| {
             // When slices are shared, it needs to be read-write if ANY of the slices is read-write,

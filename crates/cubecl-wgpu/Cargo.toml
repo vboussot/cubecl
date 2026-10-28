@@ -61,7 +61,7 @@ tracing = [
 log = { workspace = true }
 tracing = { workspace = true, features = ["attributes"], optional = true }
 
-cubecl-common = { path = "../cubecl-common", version = "0.11.3", default-features = false }
+cubecl-common = { path = "../cubecl-common", version = "0.11.3", default-features = false, features = ["hash"] }
 cubecl-core = { path = "../cubecl-core", version = "0.11.3", default-features = false }
 cubecl-environment = { path = "../cubecl-environment", version = "0.11.3", default-features = false }
 cubecl-ir = { path = "../cubecl-ir", version = "0.11.3", default-features = false }
@@ -96,6 +96,7 @@ cubecl-cpp = { path = "../cubecl-cpp", version = "0.11.3", default-features = fa
 wgpu-hal = { workspace = true, optional = true }
 
 bytemuck = { workspace = true }
+serde = { workspace = true }
 
 derive-new = { workspace = true }
 hashbrown = { workspace = true }
