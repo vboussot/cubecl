@@ -227,9 +227,16 @@ pub struct KernelCacheKey {
 
 impl KernelCacheKey {
     /// Create a key from a kernel id and the current build ID.
+    ///
+    /// The id is hashed whole: its full rendering ([`KernelId::stable_format`]) and its `Hash`, which
+    /// takes the kernel's `TypeId`. Two kernel types can render alike (two instances whose type names
+    /// print the same, an info whose `Debug` leaves a field out), and [`KernelId::stable_hash`] alone
+    /// hashes the info through a `Hash` that may leave out what its `Eq` compares; a store written
+    /// through then serves one kernel's artifact to the other. A `TypeId` is stable within a build,
+    /// which the build id (or, in a browser, an environment per build) already scopes a store to.
     pub fn new(id: &KernelId, build_id: StableHash) -> Self {
         Self {
-            id: id.stable_hash(),
+            id: StableHasher::hash_one(&(id.stable_format(), id)),
             build_id,
         }
     }
