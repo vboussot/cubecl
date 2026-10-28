@@ -2,7 +2,7 @@ use cubecl_core::server::IoError;
 use cubecl_environment::backtrace::BackTrace;
 use cubecl_environment::collections::HashMap;
 use cubecl_server::storage::{ComputeStorage, StorageHandle, StorageId, StorageUtilization};
-use std::{num::NonZeroU64, ptr::NonNull};
+use std::{num::NonZeroU64, ptr::NonNull, sync::Arc};
 use wgpu::BufferUsages;
 
 /// Minimum buffer size in bytes. The WebGPU spec requires buffer sizes > 0, and shaders
@@ -14,7 +14,7 @@ const MIN_BUFFER_SIZE: u64 = 32;
 pub struct WgpuStorage {
     memory: HashMap<StorageId, WgpuMemory>,
     /// The buffers freed since the stream last submitted, destroyed after it does.
-    retired: Vec<wgpu::Buffer>,
+    retired: Vec<(wgpu::Buffer, Arc<()>)>,
     /// The bytes `memory` holds.
     allocated: u64,
     device: wgpu::Device,
@@ -56,6 +56,10 @@ pub struct WgpuResource {
     ///
     /// The result considers the offset.
     pub size: u64,
+    /// Held while the resource is: its buffer is destroyed only once no resource of it is left.
+    #[new(default)]
+    #[allow(dead_code, reason = "held for its count, never read")]
+    pub(crate) alive: Option<Arc<()>>,
 }
 
 /// The memory that can be allocated for wgpu.
@@ -68,6 +72,9 @@ pub struct WgpuMemory {
     /// The buffer host mapping, if host visible.
     #[new(default)]
     pub(crate) host_ptr: Option<HostPtr>,
+    /// Shared by every resource handed out of the buffer ([`WgpuResource::alive`]).
+    #[new(default)]
+    pub(crate) alive: Arc<()>,
 }
 
 impl WgpuResource {
@@ -131,6 +138,7 @@ impl ComputeStorage for WgpuStorage {
             })?;
         Ok(WgpuResource {
             host_ptr: memory.host_ptr,
+            alive: Some(memory.alive.clone()),
             ..WgpuResource::new(
                 memory.buffer.clone(),
                 memory.address,
@@ -172,7 +180,7 @@ impl ComputeStorage for WgpuStorage {
         // holds it, while the stream's open encoder may still bind it.
         if let Some(memory) = self.memory.remove(&id) {
             self.allocated -= memory.buffer.size();
-            self.retired.push(memory.buffer);
+            self.retired.push((memory.buffer, memory.alive));
         }
     }
 
@@ -188,9 +196,15 @@ impl ComputeStorage for WgpuStorage {
 impl WgpuStorage {
     /// Destroy the buffers freed before the stream's last submit: no command recorded since binds them.
     pub(crate) fn destroy_retired(&mut self) {
-        for buffer in self.retired.drain(..) {
-            buffer.destroy();
-        }
+        // A resource of the buffer still held (a pinned binding, a readback in flight) may bind it again:
+        // the buffer waits for the submit after the last one is dropped.
+        self.retired.retain(|(buffer, alive)| {
+            let held = Arc::strong_count(alive) > 1;
+            if !held {
+                buffer.destroy();
+            }
+            held
+        });
     }
 
     #[cfg(feature = "spirv")]
