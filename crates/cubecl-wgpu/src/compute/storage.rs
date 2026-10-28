@@ -194,6 +194,11 @@ impl ComputeStorage for WgpuStorage {
 }
 
 impl WgpuStorage {
+    /// Whether a freed buffer is not destroyed yet.
+    pub(crate) fn has_retired(&self) -> bool {
+        !self.retired.is_empty()
+    }
+
     /// Destroy the buffers freed before the stream's last submit: no command recorded since binds them.
     pub(crate) fn destroy_retired(&mut self) {
         // A resource of the buffer still held (a pinned binding, a readback in flight) may bind it again:
