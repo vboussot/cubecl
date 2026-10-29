@@ -276,16 +276,13 @@ impl<K: AutotuneKey> Tuner<K> {
                 cur
             };
 
-            // A seeded pick indexes the kernels this device is offered; one taken from a device with
-            // more of them (a browser with the subgroups feature) points past the list and is measured
-            // instead of launched.
+            // A seeded pick names a kernel; one this device is not offered (picked on a browser with the
+            // subgroups feature, or by a build that had it) is measured instead of launched.
             if matches!(cur, TuneCacheResult::Miss)
-                && let Some(fastest_index) = cache.seeded(key)
+                && let Some(fastest_index) =
+                    cache.seeded(key, tunables.autotunables().map(|tune| tune.name.as_str()))
             {
-                if fastest_index < tunables.len() {
-                    return TuneCacheResult::Hit { fastest_index };
-                }
-                cache.forget_seeded(key);
+                return TuneCacheResult::Hit { fastest_index };
             }
 
             match cur {
@@ -693,8 +690,12 @@ async fn process_request<K: AutotuneKey>(
         // a tune that measured nothing would keep failing the same way.
         cache.lock().cache_insert(key.clone(), fastest_index);
         // Nor exported: a later run seeded with it would never measure the key.
-        if !unmeasured {
-            cache.lock().export(&key, fastest_index);
+        if !unmeasured
+            && let Some(outcome) = (results.iter())
+                .filter_map(|result| result.outcome.as_ref().ok())
+                .find(|outcome| outcome.index == fastest_index)
+        {
+            cache.lock().export(&key, &outcome.name);
         }
 
         // Not on disk, though. An unmeasured decision is a guess made to keep

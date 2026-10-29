@@ -101,11 +101,10 @@ impl PartialEq for AutotuneResult {
     }
 }
 
-/// The kernels picked in this process, keyed by [`pick_key`]: a caller exports
-/// them once tuned ([`autotune_picks`]) and seeds a later run of the same build with them
-/// ([`seed_autotune_picks`]). An index names a kernel of that build's tunable sets, so picks carry over
-/// only between runs of one build.
-static PICKS: cubecl_environment::sync::Mutex<Option<HashMap<String, usize>>> =
+/// The kernels picked in this process, each by its tunable's name under [`pick_key`]: a caller exports
+/// them once tuned ([`autotune_picks`]) and seeds a later run with them ([`seed_autotune_picks`]). A
+/// name holds across builds that keep the kernel; one a build no longer offers is measured.
+static PICKS: cubecl_environment::sync::Mutex<Option<HashMap<String, String>>> =
     cubecl_environment::sync::Mutex::new(None);
 
 fn pick_key(cache: &str, key: &impl core::fmt::Display) -> String {
@@ -113,16 +112,16 @@ fn pick_key(cache: &str, key: &impl core::fmt::Display) -> String {
 }
 
 /// Every kernel measured so far by the tuners of this process, and every seeded pick, as
-/// `(<device>/<tuner>|<key>, index)`.
-pub fn autotune_picks() -> alloc::vec::Vec<(String, usize)> {
+/// `(<device>/<tuner>|<key>, <tunable name>)`.
+pub fn autotune_picks() -> alloc::vec::Vec<(String, String)> {
     (PICKS.lock().iter().flatten())
-        .map(|(key, &index)| (key.clone(), index))
+        .map(|(key, name)| (key.clone(), name.clone()))
         .collect()
 }
 
-/// Picks a tuner takes instead of measuring, for the keys [`autotune_picks`] exported from a run of the
-/// same build.
-pub fn seed_autotune_picks(picks: impl IntoIterator<Item = (String, usize)>) {
+/// Picks a tuner takes instead of measuring, for the keys [`autotune_picks`] exported from an earlier
+/// run.
+pub fn seed_autotune_picks(picks: impl IntoIterator<Item = (String, String)>) {
     PICKS.lock().get_or_insert_with(HashMap::new).extend(picks);
 }
 
@@ -307,27 +306,37 @@ impl<K: AutotuneKey> TuneCache<K> {
         self.in_memory_cache.insert(key, CacheEntry::Pending);
     }
 
-    /// The pick seeded for `key`, now in this cache.
-    pub(crate) fn seeded(&mut self, key: &K) -> Option<usize> {
-        let index = *PICKS.lock().as_ref()?.get(&pick_key(&self.id, key))?;
-        self.cache_insert(key.clone(), index);
-        Some(index)
-    }
-
-    /// Drops a seeded pick that named no kernel of this device, so the key is measured.
-    pub(crate) fn forget_seeded(&mut self, key: &K) {
-        self.in_memory_cache.remove(key);
-        if let Some(picks) = PICKS.lock().as_mut() {
-            picks.remove(&pick_key(&self.id, key));
+    /// The pick seeded for `key`, the index of the one tunable of `names` it names, now in this cache.
+    /// A name none of `names` carries, or more than one does, is dropped, so the key is measured.
+    pub(crate) fn seeded<'a>(
+        &mut self,
+        key: &K,
+        names: impl Iterator<Item = &'a str>,
+    ) -> Option<usize> {
+        let mut picks = PICKS.lock();
+        let picks = picks.as_mut()?;
+        let pick = pick_key(&self.id, key);
+        let index = {
+            let wanted = picks.get(&pick)?;
+            let mut found = names.enumerate().filter(|(_, name)| name == wanted);
+            match (found.next(), found.next()) {
+                (Some((index, _)), None) => Some(index),
+                _ => None,
+            }
+        };
+        match index {
+            Some(index) => self.cache_insert(key.clone(), index),
+            None => _ = picks.remove(&pick),
         }
+        index
     }
 
-    /// Lists `key`'s measured pick among the picks [`autotune_picks`] exports.
-    pub(crate) fn export(&self, key: &K, fastest_index: usize) {
+    /// Lists `key`'s measured pick, the tunable `name`, among the picks [`autotune_picks`] exports.
+    pub(crate) fn export(&self, key: &K, name: &str) {
         PICKS
             .lock()
             .get_or_insert_with(HashMap::new)
-            .insert(pick_key(&self.id, key), fastest_index);
+            .insert(pick_key(&self.id, key), name.into());
     }
 
     pub(crate) fn cache_insert(&mut self, key: K, fastest_index: usize) {
@@ -466,16 +475,32 @@ mod tests {
 
     #[test]
     fn a_pick_exported_seeds_a_later_cache_of_the_same_device_and_tuner() {
-        let mut first = TuneCache::<Shape>::new("matmul", "gpu-0");
-        first.export(&Shape(7), 3);
+        let first = TuneCache::<Shape>::new("matmul", "gpu-0");
+        first.export(&Shape(7), "tiled");
+        first.export(&Shape(9), "plane");
+        first.export(&Shape(10), "twice");
         let picks = autotune_picks();
-        assert!(picks.contains(&(String::from("gpu-0/matmul|shape 7"), 3)));
+        assert!(picks.contains(&(String::from("gpu-0/matmul|shape 7"), String::from("tiled"))));
 
         seed_autotune_picks(picks);
+        // a later build that reordered its kernels takes the pick by name
+        let names = || ["simple", "tiled"].into_iter();
         let mut later = TuneCache::<Shape>::new("matmul", "gpu-0");
-        assert_eq!(later.seeded(&Shape(7)), Some(3));
-        assert_eq!(later.seeded(&Shape(8)), None);
+        assert_eq!(later.seeded(&Shape(7), names()), Some(1));
+        assert_eq!(later.seeded(&Shape(8), names()), None);
+        // one that no longer offers it measures the key
+        assert_eq!(later.seeded(&Shape(9), names()), None);
+        assert!(
+            !autotune_picks()
+                .iter()
+                .any(|(key, _)| key == "gpu-0/matmul|shape 9")
+        );
+        // nor does a name two of its kernels carry
+        assert_eq!(
+            later.seeded(&Shape(10), ["twice", "twice"].into_iter()),
+            None
+        );
         let mut other = TuneCache::<Shape>::new("conv", "gpu-0");
-        assert_eq!(other.seeded(&Shape(7)), None);
+        assert_eq!(other.seeded(&Shape(7), names()), None);
     }
 }
