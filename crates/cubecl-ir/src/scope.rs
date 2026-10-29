@@ -170,6 +170,12 @@ impl GlobalState {
 }
 
 dict_key!(ADDRESS_TYPE_KEY, "kernel_address_type");
+dict_key!(
+    /// Marks an operation registered under [`FastMath::NoContraction`]: a backend must not fuse it
+    /// with another into one rounding.
+    NO_CONTRACTION_KEY,
+    "no_contraction"
+);
 
 static TY_IDENTS: LazyLock<Mutex<HashMap<TypeId, Identifier>>> = LazyLock::new(Default::default);
 
@@ -554,6 +560,17 @@ impl Scope {
     /// Register an [`Instruction`] into the scope.
     pub fn register(&self, op: &dyn Op) {
         let ctx = self.ctx();
+        if self
+            .state()
+            .modes
+            .fp_math_mode
+            .contains(FastMath::NoContraction)
+        {
+            op.get_operation().deref_mut(ctx).attributes.set(
+                NO_CONTRACTION_KEY.clone(),
+                pliron::builtin::attributes::UnitAttr::new(),
+            );
+        }
         self.inserter().append_op(ctx, op);
     }
 

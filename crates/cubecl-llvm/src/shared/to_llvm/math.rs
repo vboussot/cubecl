@@ -380,7 +380,12 @@ macro_rules! lower_float_bin_arith {
             ) -> Result<()> {
                 let lhs = self.lhs(ctx);
                 let rhs = self.rhs(ctx);
-                let flags = $flags(ctx);
+                // An operation registered under `FastMath::NoContraction` rounds on its own.
+                let flags = if no_contraction(ctx, self.get_operation()) {
+                    FastmathFlagsAttr::default()
+                } else {
+                    $flags(ctx)
+                };
                 let op = <$llvm_op>::new_with_fast_math_flags(ctx, lhs, rhs, flags);
                 rewriter.insert_op(ctx, &op);
                 rewriter.replace_operation_with_values(
@@ -392,6 +397,14 @@ macro_rules! lower_float_bin_arith {
             }
         }
     };
+}
+
+/// Whether `op` was registered under `FastMath::NoContraction`.
+fn no_contraction(ctx: &Context, op: Ptr<Operation>) -> bool {
+    op.deref(ctx)
+        .attributes
+        .get::<pliron::builtin::attributes::UnitAttr>(&cubecl_core::ir::NO_CONTRACTION_KEY)
+        .is_some()
 }
 
 fn no_fast_math(_ctx: &Context) -> FastmathFlagsAttr {

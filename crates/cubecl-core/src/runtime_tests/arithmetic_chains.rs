@@ -4,6 +4,7 @@
 use crate::{self as cubecl};
 use alloc::vec::Vec;
 use cubecl::prelude::*;
+use cubecl_ir::EnumSet;
 use cubecl_runtime::runtime::Runtime;
 
 pub const LANES: usize = 4;
@@ -66,6 +67,32 @@ pub fn kernel_accumulate_through_a_copy<F: Float>(input: &[F], output: &mut [F],
         total = carried + input[1];
     }
     output[0] = total;
+}
+
+#[cube(launch_unchecked, fast_math = EnumSet::only(FastMath::NoContraction))]
+pub fn kernel_multiply_add_uncontracted<F: Float>(input: &[F], output: &mut [F]) {
+    output[0] = input[0] * input[1] + input[2];
+}
+
+/// Under `FastMath::NoContraction` a multiply and an add round each on its own, where a fused
+/// multiply-add rounds once: `(1 + 2^-12)^2 - 1` is `2^-11` rounded twice and `2^-11 + 2^-24` fused.
+pub fn test_no_contraction<R: Runtime>(client: Client) {
+    let near_one = 1.0 + 2f32.powi(-12);
+    let result = run(
+        &client,
+        &[near_one, near_one, -1.0],
+        1,
+        |input, output| unsafe {
+            kernel_multiply_add_uncontracted::launch_unchecked::<f32>(
+                &client,
+                CubeCount::new_single(),
+                CubeDim::new_1d(1),
+                input,
+                output,
+            )
+        },
+    )[0];
+    assert_eq!(result.to_bits(), 2f32.powi(-11).to_bits(), "{result:e}");
 }
 
 pub fn test_products<R: Runtime, F: Float + CubeElement>(client: Client) {
@@ -277,6 +304,14 @@ macro_rules! testgen_arithmetic_chains {
         fn test_arithmetic_chain_products() {
             let client = TestRuntime::client(&Default::default());
             cubecl_core::runtime_tests::arithmetic_chains::test_products::<TestRuntime, FloatType>(
+                client,
+            );
+        }
+
+        #[$crate::runtime_tests::test_log::test]
+        fn test_arithmetic_chain_no_contraction() {
+            let client = TestRuntime::client(&Default::default());
+            cubecl_core::runtime_tests::arithmetic_chains::test_no_contraction::<TestRuntime>(
                 client,
             );
         }

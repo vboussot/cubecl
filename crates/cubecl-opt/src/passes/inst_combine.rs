@@ -1,5 +1,5 @@
 use cubecl_ir::{
-    NamedRewrite,
+    NO_CONTRACTION_KEY, NamedRewrite,
     dialect::math::{FAddOp, FMulOp, FNegOp, FSubOp, FmaOp},
     prelude::{Inserter as _, Rewriter as _, *},
     rewrite::MatchRewritePass,
@@ -27,12 +27,23 @@ enum Negate {
 /// Fusing one that feeds anything else would leave it computed twice.
 fn lone_product(ctx: &Context, value: Value) -> Option<FMulOp> {
     let mul = value.defining_op()?.as_op::<FMulOp>(ctx)?;
-    (mul.get_result(ctx).num_uses(ctx) == 1).then_some(mul)
+    (mul.get_result(ctx).num_uses(ctx) == 1 && !uncontracted(ctx, mul.get_operation()))
+        .then_some(mul)
+}
+
+/// Whether `op` was registered under `FastMath::NoContraction`, which keeps it rounding on its own.
+fn uncontracted(ctx: &Context, op: Ptr<Operation>) -> bool {
+    (op.deref(ctx).attributes)
+        .get::<pliron::builtin::attributes::UnitAttr>(&NO_CONTRACTION_KEY)
+        .is_some()
 }
 
 /// The product, what is added to it, and what needs negating, for an `op` of the form
 /// `a * b + c`, `a * b - c` or `c - a * b`, in either operand order.
 fn as_fma(ctx: &Context, op: Ptr<Operation>) -> Option<(FMulOp, Value, Negate)> {
+    if uncontracted(ctx, op) {
+        return None;
+    }
     if let Some(add) = op.as_op::<FAddOp>(ctx) {
         let (lhs, rhs) = (add.lhs(ctx), add.rhs(ctx));
         return lone_product(ctx, lhs)

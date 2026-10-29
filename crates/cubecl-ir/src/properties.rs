@@ -567,11 +567,18 @@ pub enum FastMath {
     AllowTransform,
     /// Allow using lower precision intrinsics
     ReducedPrecision,
+    /// Forbid contracting float operations into fewer ones (a multiply and an add into a fused
+    /// multiply-add), even on a backend that contracts by default: each operation rounds on its own.
+    /// For a kernel whose values must match an order of rounded operations.
+    NoContraction,
 }
 
 impl FastMath {
+    /// Every optimization, [`FastMath::NoContraction`] (a restriction, not an optimization) aside.
     pub const fn all() -> EnumSet<FastMath> {
-        EnumSet::all()
+        EnumSet::all().difference(EnumSet::from_u64_truncated(
+            1 << FastMath::NoContraction as u64,
+        ))
     }
 }
 
